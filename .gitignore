@@ -1,0 +1,17 @@
+# Android build folders
+/MobileApp/app/build
+/MobileApp/app/generated
+/MobileApp/app/intermediates
+/MobileApp/app/outputs
+/MobileApp/app/tmp
+/MobileApp/app/reports
+/MobileApp/app/kotlin
+/MobileApp/app/kotlinToolingMetadata
+
+# IDE files
+/.idea
+*.iml
+
+# OS files
+.DS_Store
+Thumbs.db
