@@ -1,0 +1,3 @@
+# Mosquitto configuration for remote access
+listener 1883
+allow_anonymous true

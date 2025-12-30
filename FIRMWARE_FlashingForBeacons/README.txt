@@ -1,0 +1,1 @@
+This is the program we used to flash and update the firmware on the BLE beacons using the .hex file provided

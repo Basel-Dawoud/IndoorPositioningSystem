@@ -1,0 +1,188 @@
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include <math.h>
+
+// =================================================================
+// ‼️ 1. CONFIGURE YOUR WI-FI ‼️
+// =================================================================
+const char* ssid     = "WE_E6317B";
+const char* password = "24A09003229";
+
+// =================================================================
+// 2. MQTT BROKER CONFIGURATION
+// =================================================================
+const char* mqtt_server = "192.168.8.10";
+const int   mqtt_port   = 1883;
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// =================================================================
+// 3. ROOM & BEACON MAP (MUST MATCH YOUR PHYSICAL LAYOUT)
+// =================================================================
+const double ROOM_WIDTH  = 2.8;
+const double ROOM_HEIGHT = 3.8;
+
+struct Beacon {
+  int    minor_id;
+  double x;
+  double y;
+};
+
+// "Flipped Triangle" layout for a 2.8m x 3.8m room
+Beacon beacons[] = {
+  {1, 1.4, 0.0}, // Beacon 1 (Minor 1) at the bottom-center
+  {2, 0.0, 3.8}, // Beacon 2 (Minor 2) at the top-left
+  {3, 2.8, 3.8}  // Beacon 3 (Minor 3) at the top-right
+};
+
+// =================================================================
+// 4. CALIBRATION VALUES (MUST MATCH ANDROID APP)
+// =================================================================
+const int    TX_POWER_AT_1_METER = -54; // The value calibrated from the Android app
+const double PATH_LOSS_EXPONENT  = 2; // The value calibrated from the Android app
+
+
+// =====================================================
+// RSSI TO DISTANCE CALCULATION
+// =====================================================
+double rssiToDistance(int rssi) {
+  // Uses the single, globally calibrated values for all calculations
+  return pow(10.0, (TX_POWER_AT_1_METER - rssi) / (10.0 * PATH_LOSS_EXPONENT));
+}
+
+// =====================================================
+// TRILATERATION CALCULATION
+// =====================================================
+bool trilaterate(double r1, double r2, double r3, double &x, double &y) {
+  double x1 = beacons[0].x, y1 = beacons[0].y;
+  double x2 = beacons[1].x, y2 = beacons[1].y;
+  double x3 = beacons[2].x, y3 = beacons[2].y;
+
+  double A = 2 * (x2 - x1);
+  double B = 2 * (y2 - y1);
+  double C = r1*r1 - r2*r2 - x1*x1 + x2*x2 - y1*y1 + y2*y2;
+
+  double D = 2 * (x3 - x2);
+  double E = 2 * (y3 - y2);
+  double F = r2*r2 - r3*r3 - x2*x2 + x3*x3 - y2*y2 + y3*y3;
+
+  double denom = (A * E - B * D);
+  if (fabs(denom) < 0.001) {
+    return false; // Avoid division by zero
+  }
+
+  x = (C * E - B * F) / denom;
+  y = (A * F - C * D) / denom;
+
+  return true;
+}
+
+// =====================================================
+// MQTT CALLBACK (Handles data from the phone)
+// =====================================================
+void callback(char* topic, byte* payload, unsigned int length) {
+  Serial.println("\n--- MESSAGE RECEIVED ---");
+  
+  StaticJsonDocument<256> doc;
+  DeserializationError error = deserializeJson(doc, payload, length);
+
+  if (error) {
+    Serial.print("❌ JSON Parse Failed: ");
+    Serial.println(error.c_str());
+    return;
+  }
+
+  int rssi1 = doc["b1"];
+  int rssi2 = doc["b2"];
+  int rssi3 = doc["b3"];
+  Serial.printf("Parsed RSSI: b1=%d, b2=%d, b3=%d\n", rssi1, rssi2, rssi3);
+  
+  if (rssi1 == -100 || rssi2 == -100 || rssi3 == -100) {
+      Serial.println("Skipping calculation: At least one beacon not visible.");
+      return;
+  }
+
+  double d1 = rssiToDistance(rssi1);
+  double d2 = rssiToDistance(rssi2);
+  double d3 = rssiToDistance(rssi3);
+  Serial.printf("Calculated Distances: d1=%.2fm, d2=%.2fm, d3=%.2fm\n", d1, d2, d3);
+
+  double x, y;
+  if (!trilaterate(d1, d2, d3, x, y)) {
+    Serial.println("❌ Trilateration failed (beacons might be collinear).");
+    return;
+  }
+  
+  Serial.printf("Calculated Raw Position: X=%.2f, Y=%.2f\n", x, y);
+
+  // Normalize coordinates to a 0.0 - 1.0 scale for the Android GUI
+  double normalized_x = x / ROOM_WIDTH;
+  double normalized_y = y / ROOM_HEIGHT;
+  
+  // Clamp values to prevent the dot from going off-screen due to signal noise
+  normalized_x = constrain(normalized_x, 0.0, 1.0);
+  normalized_y = constrain(normalized_y, 0.0, 1.0);
+  
+  // =====================================================
+  // SEND RESULT BACK TO PHONE
+  // =====================================================
+  StaticJsonDocument<128> outDoc;
+  outDoc["x"] = normalized_x; // Android app expects "x"
+  outDoc["y"] = normalized_y; // Android app expects "y"
+
+  char buffer[128];
+  size_t n = serializeJson(outDoc, buffer);
+
+  Serial.printf("Publishing to ips/result: %s\n", buffer);
+  client.publish("ips/result", buffer, n); // <-- CORRECTED TOPIC
+}
+
+// =====================================================
+// MQTT RECONNECT LOGIC
+// =====================================================
+void reconnectMQTT() {
+  while (!client.connected()) {
+    Serial.print("Connecting to MQTT broker...");
+    if (client.connect("ESP32_IPS_Server")) {
+      Serial.println(" connected.");
+      client.subscribe("ips/beacons");
+    } else {
+      Serial.print(" failed (rc=");
+      Serial.print(client.state());
+      Serial.println("), retrying in 2 seconds...");
+      delay(2000);
+    }
+  }
+}
+
+// =====================================================
+// SETUP
+// =====================================================
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\nESP32 Indoor Positioning Server - Final Version");
+
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi connected.");
+  Serial.print("ESP32 IP Address: ");
+  Serial.println(WiFi.localIP());
+
+  client.setServer(mqtt_server, mqtt_port);
+  client.setCallback(callback);
+}
+
+// =====================================================
+// MAIN LOOP
+// =====================================================
+void loop() {
+  if (!client.connected()) {
+    reconnectMQTT();
+  }
+  client.loop();
+}
